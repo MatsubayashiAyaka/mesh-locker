@@ -3,18 +3,19 @@
 # ============================================================================
 # 選択した要素（頂点集合）をロックし、移動・削除を防止するアドオン
 #
-# v5.4.2 修正点（v5.4.1 からの修正）
-# - Blender 4.2: Panel.draw() で Scene プロパティへ書き込みすると例外になるため修正
-#   * draw() 内で props.lock_count を更新しない（表示は都度 count_locked_from_attr(obj) を使用）
-#   * lock_count 更新はオペレータ実行時と register() 時のみ
-# - UIが空になる原因（draw例外）を解消
-# - 他機能（ロック/解除、削除・移動ガード、解除モード、自己修復）は維持
+# v5.5.0 新機能:
+# - 「ロック解除範囲選択」モード中にロック頂点/エッジを色付け表示
+#   * ロック頂点: 両端がロックされている頂点
+#   * ロックエッジ: 両端の頂点がロックされている辺
+#   * 未選択 → 基準色、選択中 → 強調色
+# - GPU描画ハンドラを使用（読み取り専用で安全）
+# - 表示設定パネル追加（色・サイズ調整可能）
 # ============================================================================
 
 bl_info = {
     "name": "Mesh Lock",
     "author": "Claude AI / ChatGPT",
-    "version": (5, 4, 2),
+    "version": (5, 5, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mesh Lock",
     "description": "選択した要素をロックして移動・削除を防止します",
@@ -23,8 +24,10 @@ bl_info = {
 
 import bpy
 import bmesh
+import gpu
+from gpu_extras.batch import batch_for_shader
 from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import IntProperty, PointerProperty
+from bpy.props import IntProperty, PointerProperty, FloatVectorProperty, FloatProperty, BoolProperty
 
 # =============================================================================
 # プロパティ
@@ -32,16 +35,54 @@ from bpy.props import IntProperty, PointerProperty
 
 class MESHLOCK_Properties(PropertyGroup):
     lock_count: IntProperty(name="ロック頂点数", default=0)
+    
+    # 表示設定
+    show_locked: BoolProperty(
+        name="ロック要素を表示",
+        description="解除モード中にロック頂点/エッジを色付け表示します",
+        default=True
+    )
+    base_color: FloatVectorProperty(
+        name="基準色",
+        description="ロック要素（未選択）の色",
+        subtype='COLOR',
+        size=4,
+        min=0.0, max=1.0,
+        default=(1.0, 0.3, 0.3, 0.9)
+    )
+    highlight_color: FloatVectorProperty(
+        name="強調色",
+        description="ロック要素（選択中）の色",
+        subtype='COLOR',
+        size=4,
+        min=0.0, max=1.0,
+        default=(1.0, 1.0, 0.0, 1.0)
+    )
+    point_size: FloatProperty(
+        name="頂点サイズ",
+        description="ロック頂点の表示サイズ",
+        min=1.0, max=20.0,
+        default=8.0
+    )
+    line_width: FloatProperty(
+        name="エッジ線幅",
+        description="ロックエッジの線幅",
+        min=1.0, max=10.0,
+        default=3.0
+    )
 
 # =============================================================================
 # 定数
 # =============================================================================
 
 LOCK_LAYER_NAME = "mesh_lock_vert"
-UNLOCK_MODE_PROP = "_meshlock_unlock_mode"  # Object に持たせる解除モードフラグ（対象オブジェクト限定）
+UNLOCK_MODE_PROP = "_meshlock_unlock_mode"
+
+# GPU描画ハンドラ
+_draw_handler = None
 
 # =============================================================================
-# ロックデータ管理（LOCK_LAYER が常に真）
+# ロックデータ管理
 # =============================================================================
 
 def ensure_lock_layer(bm: bmesh.types.BMesh):
@@ -132,13 +173,11 @@ def ensure_lock_attr_synced_from_bmesh(obj: bpy.types.Object, bm: bmesh.types.BM
     if not bmesh_locked and not attr:
         return False
 
-    # attributes が無いがBMeshにロックがある → 作って同期
     if bmesh_locked and not attr:
         _ensure_attr_layer(mesh)
         save_lock_to_attributes(obj, bm)
         return True
 
-    # 両方あるなら、ロック数の差分があれば同期（軽量）
     if attr:
         attr_locked = count_locked_from_attr(obj)
         bm_locked = count_locked_from_bmesh(bm)
@@ -243,9 +282,6 @@ def selection_locked_verts(bm: bmesh.types.BMesh, mode: str):
 def is_all_visible_selected(bm: bmesh.types.BMesh, mode: str) -> bool:
     """
     「可視（not hide）の要素が全て選択されているか」を判定
-    - VERT: 可視頂点が全選択
-    - EDGE: 可視辺が全選択
-    - FACE: 可視面が全選択
     """
     if mode == 'VERT':
         any_visible = False
@@ -302,7 +338,7 @@ def _deselect_edges_faces_related_to_locked_verts(bm: bmesh.types.BMesh, locked_
             continue
 
 # =============================================================================
-# 解除モード管理（対象オブジェクト限定） + 自己修復
+# 解除モード管理 + 自己修復
 # =============================================================================
 
 def is_unlock_mode(obj: bpy.types.Object) -> bool:
@@ -338,14 +374,9 @@ def ensure_consistent_lock_state(context, obj: bpy.types.Object):
     mesh = obj.data
     bm = bmesh.from_edit_mesh(mesh)
 
-    # まず attributes をロード（存在するなら）
     load_lock_from_attributes(obj, bm)
-
-    # BMeshにロックがあるのに attributes が無い/ズレてる → 自己修復同期
     ensure_lock_attr_synced_from_bmesh(obj, bm)
 
-    # 解除モード中は「勝手にモードを落とさない」
-    # ただしロックが実在しない等の明確な矛盾のみ復帰
     if is_unlock_mode(obj):
         if not has_any_locked_from_attr(obj) and not has_any_locked_from_bmesh(bm):
             set_unlock_mode(obj, False)
@@ -353,7 +384,6 @@ def ensure_consistent_lock_state(context, obj: bpy.types.Object):
             bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         return
 
-    # 通常モード：ロック頂点は hide されているべき
     layer = get_lock_layer(bm)
     if layer is None:
         return
@@ -369,6 +399,147 @@ def ensure_consistent_lock_state(context, obj: bpy.types.Object):
         apply_hide_to_locked(bm)
         _clear_selection_history(bm)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+# =============================================================================
+# GPU描画（ロック要素の可視化）
+# =============================================================================
+
+def draw_locked_elements():
+    """解除モード中にロック頂点/エッジを色付け表示"""
+    try:
+        context = bpy.context
+        obj = context.active_object
+        
+        # 条件チェック
+        if obj is None or obj.type != 'MESH' or obj.mode != 'EDIT':
+            return
+        
+        if not is_unlock_mode(obj):
+            return
+        
+        props = context.scene.mesh_lock_props
+        if not props.show_locked:
+            return
+        
+        # BMeshを取得（読み取り専用）
+        try:
+            bm = bmesh.from_edit_mesh(obj.data)
+        except Exception:
+            return
+        
+        layer = get_lock_layer(bm)
+        if layer is None:
+            return
+        
+        # ワールド行列
+        matrix = obj.matrix_world
+        
+        # ロック頂点を収集（選択/未選択で分類）
+        locked_verts_selected = []
+        locked_verts_unselected = []
+        locked_vert_indices = set()
+        
+        bm.verts.ensure_lookup_table()
+        for v in bm.verts:
+            if int(v[layer]) == 1:
+                locked_vert_indices.add(v.index)
+                world_co = matrix @ v.co
+                if v.select:
+                    locked_verts_selected.append(world_co)
+                else:
+                    locked_verts_unselected.append(world_co)
+        
+        # ロックエッジを収集（両端がロック頂点の辺、選択/未選択で分類）
+        locked_edges_selected = []
+        locked_edges_unselected = []
+        
+        bm.edges.ensure_lookup_table()
+        for e in bm.edges:
+            v0, v1 = e.verts
+            if v0.index in locked_vert_indices and v1.index in locked_vert_indices:
+                co0 = matrix @ v0.co
+                co1 = matrix @ v1.co
+                if e.select:
+                    locked_edges_selected.append(co0)
+                    locked_edges_selected.append(co1)
+                else:
+                    locked_edges_unselected.append(co0)
+                    locked_edges_unselected.append(co1)
+        
+        # 描画するものがなければ終了
+        if not any([locked_verts_selected, locked_verts_unselected, 
+                    locked_edges_selected, locked_edges_unselected]):
+            return
+        
+        # シェーダー
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        
+        # 色の取得
+        base_color = tuple(props.base_color)
+        highlight_color = tuple(props.highlight_color)
+        
+        # GPU状態設定
+        gpu.state.depth_test_set('LESS_EQUAL')
+        gpu.state.blend_set('ALPHA')
+        
+        # 未選択エッジを描画（基準色）
+        if locked_edges_unselected:
+            gpu.state.line_width_set(props.line_width)
+            batch = batch_for_shader(shader, 'LINES', {"pos": locked_edges_unselected})
+            shader.bind()
+            shader.uniform_float("color", base_color)
+            batch.draw(shader)
+        
+        # 選択中エッジを描画（強調色）
+        if locked_edges_selected:
+            gpu.state.line_width_set(props.line_width + 1.0)
+            batch = batch_for_shader(shader, 'LINES', {"pos": locked_edges_selected})
+            shader.bind()
+            shader.uniform_float("color", highlight_color)
+            batch.draw(shader)
+        
+        # 未選択頂点を描画（基準色）
+        if locked_verts_unselected:
+            gpu.state.point_size_set(props.point_size)
+            batch = batch_for_shader(shader, 'POINTS', {"pos": locked_verts_unselected})
+            shader.bind()
+            shader.uniform_float("color", base_color)
+            batch.draw(shader)
+        
+        # 選択中頂点を描画（強調色）
+        if locked_verts_selected:
+            gpu.state.point_size_set(props.point_size + 2.0)
+            batch = batch_for_shader(shader, 'POINTS', {"pos": locked_verts_selected})
+            shader.bind()
+            shader.uniform_float("color", highlight_color)
+            batch.draw(shader)
+        
+        # GPU状態をリセット
+        gpu.state.depth_test_set('NONE')
+        gpu.state.blend_set('NONE')
+        gpu.state.point_size_set(1.0)
+        gpu.state.line_width_set(1.0)
+        
+    except Exception:
+        # 描画中の例外は無視（クラッシュ防止）
+        pass
+
+
+def register_draw_handler():
+    """GPU描画ハンドラを登録"""
+    global _draw_handler
+    if _draw_handler is None:
+        _draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_locked_elements, (), 'WINDOW', 'POST_VIEW'
+        )
+
+
+def unregister_draw_handler():
+    """GPU描画ハンドラを解除"""
+    global _draw_handler
+    if _draw_handler is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_draw_handler, 'WINDOW')
+        _draw_handler = None
 
 # =============================================================================
 # ロック / 解除オペレーター
@@ -398,11 +569,9 @@ class MESHLOCK_OT_lock_selection(Operator):
             self.report({'WARNING'}, "選択がありません")
             return {'CANCELLED'}
 
-        # 解除モード中にロック操作は混乱の元なので解除モードを落とす（安全）
         if is_unlock_mode(obj):
             set_unlock_mode(obj, False)
 
-        # クラッシュ回避：Edge/Face 選択を落とす
         if mode == 'EDGE':
             for e in bm.edges:
                 if e.select:
@@ -429,11 +598,11 @@ class MESHLOCK_OT_lock_selection(Operator):
         save_lock_to_attributes(obj, bm)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
-        # lock_count は安全タイミング（オペレータ内）で更新
         context.scene.mesh_lock_props.lock_count = count_locked_from_attr(obj)
 
         self.report({'INFO'}, f"{newly_locked}個の頂点をロックしました")
         return {'FINISHED'}
+
 
 class MESHLOCK_OT_begin_unlock_select(Operator):
     bl_idname = "mesh.lock_begin_unlock_select"
@@ -453,7 +622,6 @@ class MESHLOCK_OT_begin_unlock_select(Operator):
         bm = bmesh.from_edit_mesh(obj.data)
         load_lock_from_attributes(obj, bm)
 
-        # ロック存在判定：attributes優先、無ければBMeshフォールバック
         locked_count_attr = count_locked_from_attr(obj)
         locked_count_bm = count_locked_from_bmesh(bm)
 
@@ -462,13 +630,10 @@ class MESHLOCK_OT_begin_unlock_select(Operator):
             self.report({'WARNING'}, "ロックされた要素がありません")
             return {'CANCELLED'}
 
-        # BMeshにロックがあるのに attributes が無い/ズレてる → ここで自己修復同期
         ensure_lock_attr_synced_from_bmesh(obj, bm)
 
-        # ロック頂点を表示
         shown = unhide_locked_only(bm)
 
-        # 選択整合：Edge/Face 選択は落としておく
         for e in bm.edges:
             if e.select:
                 e.select = False
@@ -481,7 +646,6 @@ class MESHLOCK_OT_begin_unlock_select(Operator):
 
         set_unlock_mode(obj, True)
 
-        # lock_count は安全タイミングで更新
         context.scene.mesh_lock_props.lock_count = count_locked_from_attr(obj)
 
         if shown == 0:
@@ -489,6 +653,7 @@ class MESHLOCK_OT_begin_unlock_select(Operator):
         else:
             self.report({'INFO'}, f"{shown}個のロック頂点を表示しました。解除したい範囲を選択してください")
         return {'FINISHED'}
+
 
 class MESHLOCK_OT_unlock_selection(Operator):
     bl_idname = "mesh.unlock_selection"
@@ -519,32 +684,28 @@ class MESHLOCK_OT_unlock_selection(Operator):
 
         mode = get_select_mode(context)
 
-        # 「選択範囲に含まれるロックだけ解除」を厳密に
         locked_to_unlock = selection_locked_verts(bm, mode)
 
         if not locked_to_unlock:
-            # 解除0件 → モード維持（ユーザーが選び直せる）
             self.report({'WARNING'}, "選択にロック頂点が含まれていません。解除したいロック頂点を選択してください")
             return {'CANCELLED'}
 
         for v in locked_to_unlock:
             v[layer] = 0
 
-        # 残りロックを再hide（解除した頂点は表示のまま）
         apply_hide_to_locked(bm)
         _clear_selection_history(bm)
 
         save_lock_to_attributes(obj, bm)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
-        # 解除成功時のみモード終了
         set_unlock_mode(obj, False)
 
-        # lock_count は安全タイミングで更新
         context.scene.mesh_lock_props.lock_count = count_locked_from_attr(obj)
 
         self.report({'INFO'}, f"{len(locked_to_unlock)}個の頂点のロックを解除しました")
         return {'FINISHED'}
+
 
 class MESHLOCK_OT_unlock_all(Operator):
     bl_idname = "mesh.unlock_all"
@@ -589,14 +750,13 @@ class MESHLOCK_OT_unlock_all(Operator):
 
         set_unlock_mode(obj, False)
 
-        # lock_count は安全タイミングで更新
         context.scene.mesh_lock_props.lock_count = 0
 
         self.report({'INFO'}, f"{changed}個の頂点のロックを解除しました")
         return {'FINISHED'}
 
 # =============================================================================
-# ガード：削除（Edge/Face も頂点削除として実行）
+# ガード：削除
 # =============================================================================
 
 class MESHLOCK_OT_guard_delete(Operator):
@@ -631,7 +791,6 @@ class MESHLOCK_OT_guard_delete(Operator):
             self.report({'WARNING'}, "ロックされた要素が存在するため、全選択での削除はできません")
             return {'CANCELLED'}
 
-        # 頂点削除として正規化
         for e in bm.edges:
             if e.select:
                 e.select = False
@@ -652,7 +811,7 @@ class MESHLOCK_OT_guard_delete(Operator):
         return {'FINISHED'}
 
 # =============================================================================
-# ガード：移動（クラッシュ回避）
+# ガード：移動
 # =============================================================================
 
 class MESHLOCK_OT_guard_translate(Operator):
@@ -705,12 +864,10 @@ class MESHLOCK_PT_panel(Panel):
         layout = self.layout
         obj = context.active_object
 
-        # 自己修復（ハンドラ無し）：描画のたびに整合だけ取る（ただし Scene への書き込みはしない）
         if obj and obj.type == 'MESH' and obj.mode == 'EDIT':
             try:
                 ensure_consistent_lock_state(context, obj)
             except Exception:
-                # draw中例外でUIが消えるのを避ける
                 pass
 
         col = layout.column(align=True)
@@ -719,7 +876,6 @@ class MESHLOCK_PT_panel(Panel):
         col.operator("mesh.lock_selection", icon='LOCKED')
         col.operator("mesh.lock_begin_unlock_select", text="ロック解除範囲選択", icon='RESTRICT_SELECT_OFF')
 
-        # 解除ボタン：解除モードON かつ 選択にロックが含まれるときのみ活性
         row = col.row(align=True)
         row.enabled = False
         row.operator("mesh.unlock_selection", text="選択箇所のロック解除", icon='UNLOCKED')
@@ -738,7 +894,6 @@ class MESHLOCK_PT_panel(Panel):
 
         layout.separator()
 
-        # 表示は都度計算（draw中にSceneへ書き込まない）
         lock_count = 0
         if obj and obj.type == 'MESH':
             try:
@@ -747,12 +902,39 @@ class MESHLOCK_PT_panel(Panel):
                 lock_count = 0
         layout.label(text=f"ロック頂点: {lock_count}")
 
+        # 解除モード表示
+        if obj and obj.type == 'MESH' and is_unlock_mode(obj):
+            box = layout.box()
+            box.label(text="解除モード中", icon='INFO')
+
         if not (obj and obj.type == 'MESH' and obj.mode == 'EDIT'):
             layout.separator()
             layout.label(text="Editモードで使用", icon='INFO')
 
+
+class MESHLOCK_PT_display_panel(Panel):
+    bl_label = "表示設定"
+    bl_idname = "MESHLOCK_PT_display_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Mesh Lock'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.mesh_lock_props
+
+        layout.prop(props, "show_locked")
+        
+        col = layout.column()
+        col.enabled = props.show_locked
+        col.prop(props, "base_color", text="基準色")
+        col.prop(props, "highlight_color", text="強調色")
+        col.prop(props, "point_size")
+        col.prop(props, "line_width")
+
 # =============================================================================
-# キーマップ（default をスキャンし、実際の割当位置へ guard を刺す）
+# キーマップ
 # =============================================================================
 
 addon_keymaps = []
@@ -779,7 +961,7 @@ def register_keymaps():
     if not kc_def or not kc_add:
         return
 
-    created = {}  # (name, space, region) -> addon keymap
+    created = {}
 
     def get_or_make_addon_km(src_km: bpy.types.KeyMap):
         key = _km_key(src_km)
@@ -813,7 +995,6 @@ def register_keymaps():
                 _copy_modifiers_from(kmi, new_kmi)
                 addon_keymaps.append((addon_km, new_kmi))
 
-    # 保険：Mesh(EMPTY) にも刺す
     try:
         km = kc_add.keymaps.new(name="Mesh", space_type='EMPTY')
         for key in ('X', 'DEL', 'BACK_SPACE'):
@@ -822,7 +1003,6 @@ def register_keymaps():
         kmi = km.keymap_items.new("mesh.lock_guard_translate", 'G', 'PRESS')
         addon_keymaps.append((km, kmi))
 
-        # ロック/解除ショートカット（任意）
         kmi = km.keymap_items.new("mesh.lock_selection", 'L', 'PRESS', ctrl=True, shift=True)
         addon_keymaps.append((km, kmi))
         kmi = km.keymap_items.new("mesh.lock_begin_unlock_select", 'U', 'PRESS', ctrl=True, shift=True)
@@ -851,6 +1031,7 @@ classes = (
     MESHLOCK_OT_guard_delete,
     MESHLOCK_OT_guard_translate,
     MESHLOCK_PT_panel,
+    MESHLOCK_PT_display_panel,
 )
 
 def register():
@@ -859,7 +1040,6 @@ def register():
 
     bpy.types.Scene.mesh_lock_props = PointerProperty(type=MESHLOCK_Properties)
 
-    # 既存データがあれば lock_count を即時反映（Edit中ならhide適用も）
     try:
         ctx = bpy.context
         obj = ctx.active_object
@@ -877,9 +1057,11 @@ def register():
         pass
 
     register_keymaps()
-    print("Mesh Lock v5.4.2: enabled")
+    register_draw_handler()
+    print("Mesh Lock v5.5.0: enabled")
 
 def unregister():
+    unregister_draw_handler()
     unregister_keymaps()
 
     if hasattr(bpy.types.Scene, "mesh_lock_props"):
@@ -895,7 +1077,7 @@ def unregister():
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 
-    print("Mesh Lock v5.4.2: disabled")
+    print("Mesh Lock v5.5.0: disabled")
 
 if __name__ == "__main__":
     register()
