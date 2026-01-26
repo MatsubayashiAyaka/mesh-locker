@@ -761,7 +761,6 @@ class MESHLOCK_OT_unlock_all(Operator):
 class MESHLOCK_OT_guard_delete(Operator):
     bl_idname = "mesh.lock_guard_delete"
     bl_label = "Mesh Lock: Guard Delete"
-    bl_description = "ロック頂点に触れている削除、およびロック存在時の全選択削除をブロックします"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -771,43 +770,28 @@ class MESHLOCK_OT_guard_delete(Operator):
 
     def execute(self, context):
         obj = context.active_object
-        ensure_consistent_lock_state(context, obj)
 
-        locked_exists = has_any_locked_from_attr(obj)
+        # ★★★ ここが最重要修正 ★★★
+        if not has_any_locked_from_attr(obj):
+            return {'PASS_THROUGH'}
+
         bm = bmesh.from_edit_mesh(obj.data)
         mode = get_select_mode(context)
 
         selected_verts = collect_selected_verts(bm, mode)
         if not selected_verts:
-            self.report({'WARNING'}, "削除できる選択がありません")
             return {'CANCELLED'}
 
         if selection_has_locked(bm, mode):
             self.report({'WARNING'}, "ロックされた要素が選択に含まれているため削除できません")
             return {'CANCELLED'}
 
-        if locked_exists and is_all_visible_verts_in_set(bm, selected_verts):
-            self.report({'WARNING'}, "ロックされた要素が存在するため、全選択での削除はできません")
+        if is_all_visible_verts_in_set(bm, selected_verts):
+            self.report({'WARNING'}, "ロックされた要素が存在するため、全選択削除はできません")
             return {'CANCELLED'}
 
-        for e in bm.edges:
-            if e.select:
-                e.select = False
-        for f in bm.faces:
-            if f.select:
-                f.select = False
-        for v in bm.verts:
-            if v.select:
-                v.select = False
-        for v in selected_verts:
-            if not v.hide:
-                v.select = True
+        return {'PASS_THROUGH'}
 
-        _clear_selection_history(bm)
-        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-
-        bpy.ops.mesh.delete(type='VERT')
-        return {'FINISHED'}
 
 # =============================================================================
 # ガード：移動
