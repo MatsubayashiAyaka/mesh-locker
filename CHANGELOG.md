@@ -5,6 +5,21 @@
 
 ---
 
+## [1.1.1]
+
+### Fixed
+- Delete guard continued intercepting normal Delete operations after all locks were removed
+- Now correctly returns PASS_THROUGH when no locked elements exist
+
+### Changed
+- Delete behavior fully restored to Blender default when lock count is 0
+- More predictable and stable guard logic
+
+### Notes
+- This version fixes unintended mesh deletion affecting non-selected elements after unlock
+- Recommended update for all users
+
+
 ## [1.0.1]
 
 ### Added
