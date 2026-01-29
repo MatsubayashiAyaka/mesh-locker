@@ -14,7 +14,7 @@
 bl_info = {
     "name": "Mesh Lock",
     "author": "Claude AI / ChatGPT",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mesh Lock",
     "description": "選択した要素をロックして移動・削除を防止します",
@@ -654,6 +654,36 @@ class MESHLOCK_OT_begin_unlock_select(Operator):
         return {'FINISHED'}
 
 
+class MESHLOCK_OT_cancel_unlock_mode(Operator):
+    bl_idname = "mesh.lock_cancel_unlock_mode"
+    bl_label = "ロック解除キャンセル"
+    bl_description = "ロック解除モードをキャンセルして、ロック頂点を再度非表示にします"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT' and is_unlock_mode(obj)
+
+    def execute(self, context):
+        obj = context.active_object
+        
+        bm = bmesh.from_edit_mesh(obj.data)
+        load_lock_from_attributes(obj, bm)
+        
+        # ロック頂点を再度hideにする
+        apply_hide_to_locked(bm)
+        _clear_selection_history(bm)
+        
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        
+        # 解除モードをオフにする
+        set_unlock_mode(obj, False)
+        
+        self.report({'INFO'}, "ロック解除モードをキャンセルしました")
+        return {'FINISHED'}
+
+
 class MESHLOCK_OT_unlock_selection(Operator):
     bl_idname = "mesh.unlock_selection"
     bl_label = "選択箇所のロック解除"
@@ -755,12 +785,13 @@ class MESHLOCK_OT_unlock_all(Operator):
         return {'FINISHED'}
 
 # =============================================================================
-# ガード：削除
+# ガード：削除（Xキー用 - ダイアログなし）
 # =============================================================================
 
-class MESHLOCK_OT_guard_delete(Operator):
-    bl_idname = "mesh.lock_guard_delete"
-    bl_label = "Mesh Lock: Guard Delete"
+class MESHLOCK_OT_guard_delete_x(Operator):
+    bl_idname = "mesh.lock_guard_delete_x"
+    bl_label = "Mesh Lock: Guard Delete (X)"
+    bl_description = "ロック頂点に触れている削除、およびロック存在時の全選択削除をブロックします（ダイアログなし）"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -770,28 +801,112 @@ class MESHLOCK_OT_guard_delete(Operator):
 
     def execute(self, context):
         obj = context.active_object
+        ensure_consistent_lock_state(context, obj)
 
-        # ★★★ ここが最重要修正 ★★★
-        if not has_any_locked_from_attr(obj):
-            return {'PASS_THROUGH'}
-
+        locked_exists = has_any_locked_from_attr(obj)
         bm = bmesh.from_edit_mesh(obj.data)
         mode = get_select_mode(context)
 
         selected_verts = collect_selected_verts(bm, mode)
         if not selected_verts:
+            self.report({'WARNING'}, "削除できる選択がありません")
             return {'CANCELLED'}
 
         if selection_has_locked(bm, mode):
             self.report({'WARNING'}, "ロックされた要素が選択に含まれているため削除できません")
             return {'CANCELLED'}
 
-        if is_all_visible_verts_in_set(bm, selected_verts):
-            self.report({'WARNING'}, "ロックされた要素が存在するため、全選択削除はできません")
+        if locked_exists and is_all_visible_verts_in_set(bm, selected_verts):
+            self.report({'WARNING'}, "ロックされた要素が存在するため、全選択での削除はできません")
             return {'CANCELLED'}
 
-        return {'PASS_THROUGH'}
+        # 選択を再構成：ロックされていない頂点のみを選択状態にする
+        for e in bm.edges:
+            if e.select:
+                e.select = False
+        for f in bm.faces:
+            if f.select:
+                f.select = False
+        for v in bm.verts:
+            if v.select:
+                v.select = False
+        for v in selected_verts:
+            if not v.hide:
+                v.select = True
 
+        _clear_selection_history(bm)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+        # ダイアログなしで直接削除（頂点削除でロック頂点を確実に保護）
+        bpy.ops.mesh.delete(type='VERT')
+        return {'FINISHED'}
+
+# =============================================================================
+# ガード：削除（DEL/BACK_SPACEキー用 - ダイアログあり）
+# =============================================================================
+
+class MESHLOCK_OT_guard_delete_dialog(Operator):
+    bl_idname = "mesh.lock_guard_delete_dialog"
+    bl_label = "Mesh Lock: Guard Delete (Dialog)"
+    bl_description = "ロック頂点に触れている削除、およびロック存在時の全選択削除をブロックします（ダイアログ表示）"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        ensure_consistent_lock_state(context, obj)
+
+        locked_exists = has_any_locked_from_attr(obj)
+        bm = bmesh.from_edit_mesh(obj.data)
+        mode = get_select_mode(context)
+
+        selected_verts = collect_selected_verts(bm, mode)
+        if not selected_verts:
+            self.report({'WARNING'}, "削除できる選択がありません")
+            return {'CANCELLED'}
+
+        if selection_has_locked(bm, mode):
+            self.report({'WARNING'}, "ロックされた要素が選択に含まれているため削除できません")
+            return {'CANCELLED'}
+
+        if locked_exists and is_all_visible_verts_in_set(bm, selected_verts):
+            self.report({'WARNING'}, "ロックされた要素が存在するため、全選択での削除はできません")
+            return {'CANCELLED'}
+
+        # 選択を再構成：ロック頂点に接続していない要素のみを選択状態にする
+        
+        # フェースの選択を再構成：すべての頂点がselected_vertsに含まれるフェースのみ選択維持
+        for f in bm.faces:
+            if f.select:
+                all_verts_safe = all(v in selected_verts for v in f.verts)
+                if not all_verts_safe:
+                    f.select = False
+        
+        # エッジの選択を再構成：両端の頂点が両方ともselected_vertsに含まれるエッジのみ選択維持
+        for e in bm.edges:
+            if e.select:
+                both_verts_safe = all(v in selected_verts for v in e.verts)
+                if not both_verts_safe:
+                    e.select = False
+        
+        # 頂点の選択を再構成
+        for v in bm.verts:
+            if v.select:
+                v.select = False
+        for v in selected_verts:
+            if not v.hide:
+                v.select = True
+
+        _clear_selection_history(bm)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+        # 完全なDeleteメニューを表示（Dissolve系、Collapse、Edge Loopsなどを含む）
+        bpy.ops.wm.call_menu(name='VIEW3D_MT_edit_mesh_delete')
+        return {'FINISHED'}
 
 # =============================================================================
 # ガード：移動
@@ -857,7 +972,12 @@ class MESHLOCK_PT_panel(Panel):
         col.scale_y = 1.2
 
         col.operator("mesh.lock_selection", icon='LOCKED')
-        col.operator("mesh.lock_begin_unlock_select", text="ロック解除範囲選択", icon='RESTRICT_SELECT_OFF')
+        
+        # 解除モード中は「ロック解除キャンセル」ボタンを表示、そうでなければ「ロック解除範囲選択」ボタン
+        if obj and obj.type == 'MESH' and obj.mode == 'EDIT' and is_unlock_mode(obj):
+            col.operator("mesh.lock_cancel_unlock_mode", text="ロック解除キャンセル", icon='CANCEL')
+        else:
+            col.operator("mesh.lock_begin_unlock_select", text="ロック解除範囲選択", icon='RESTRICT_SELECT_OFF')
 
         row = col.row(align=True)
         row.enabled = False
@@ -921,7 +1041,6 @@ class MESHLOCK_PT_display_panel(Panel):
 # =============================================================================
 
 addon_keymaps = []
-_DELETE_KEYS = {"X", "DEL", "BACK_SPACE"}
 
 def _km_key(km: bpy.types.KeyMap):
     return (km.name, km.space_type, km.region_type)
@@ -966,11 +1085,19 @@ def register_keymaps():
             continue
 
         for kmi in km.keymap_items:
-            if kmi.idname == "mesh.delete" and kmi.type in _DELETE_KEYS and kmi.value == "PRESS":
+            # mesh.delete のキーマップをオーバーライド
+            if kmi.idname == "mesh.delete" and kmi.value == "PRESS":
                 addon_km = get_or_make_addon_km(km)
-                new_kmi = addon_km.keymap_items.new("mesh.lock_guard_delete", kmi.type, "PRESS")
-                _copy_modifiers_from(kmi, new_kmi)
-                addon_keymaps.append((addon_km, new_kmi))
+                # Xキー → ダイアログなし
+                if kmi.type == "X":
+                    new_kmi = addon_km.keymap_items.new("mesh.lock_guard_delete_x", kmi.type, "PRESS")
+                    _copy_modifiers_from(kmi, new_kmi)
+                    addon_keymaps.append((addon_km, new_kmi))
+                # DEL/BACK_SPACE → ダイアログあり
+                elif kmi.type in ("DEL", "BACK_SPACE"):
+                    new_kmi = addon_km.keymap_items.new("mesh.lock_guard_delete_dialog", kmi.type, "PRESS")
+                    _copy_modifiers_from(kmi, new_kmi)
+                    addon_keymaps.append((addon_km, new_kmi))
 
             if kmi.idname == "transform.translate" and kmi.type == "G" and kmi.value == "PRESS":
                 addon_km = get_or_make_addon_km(km)
@@ -980,9 +1107,14 @@ def register_keymaps():
 
     try:
         km = kc_add.keymaps.new(name="Mesh", space_type='EMPTY')
-        for key in ('X', 'DEL', 'BACK_SPACE'):
-            kmi = km.keymap_items.new("mesh.lock_guard_delete", key, 'PRESS')
+        # Xキー → ダイアログなし
+        kmi = km.keymap_items.new("mesh.lock_guard_delete_x", 'X', 'PRESS')
+        addon_keymaps.append((km, kmi))
+        # DEL/BACK_SPACE → ダイアログあり
+        for key in ('DEL', 'BACK_SPACE'):
+            kmi = km.keymap_items.new("mesh.lock_guard_delete_dialog", key, 'PRESS')
             addon_keymaps.append((km, kmi))
+        
         kmi = km.keymap_items.new("mesh.lock_guard_translate", 'G', 'PRESS')
         addon_keymaps.append((km, kmi))
 
@@ -1009,9 +1141,11 @@ classes = (
     MESHLOCK_Properties,
     MESHLOCK_OT_lock_selection,
     MESHLOCK_OT_begin_unlock_select,
+    MESHLOCK_OT_cancel_unlock_mode,
     MESHLOCK_OT_unlock_selection,
     MESHLOCK_OT_unlock_all,
-    MESHLOCK_OT_guard_delete,
+    MESHLOCK_OT_guard_delete_x,
+    MESHLOCK_OT_guard_delete_dialog,
     MESHLOCK_OT_guard_translate,
     MESHLOCK_PT_panel,
     MESHLOCK_PT_display_panel,
@@ -1041,7 +1175,7 @@ def register():
 
     register_keymaps()
     register_draw_handler()
-    print("Mesh Lock v5.5.0: enabled")
+    print("Mesh Lock v1.2.0: enabled")
 
 def unregister():
     unregister_draw_handler()
@@ -1060,7 +1194,7 @@ def unregister():
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 
-    print("Mesh Lock v5.5.0: disabled")
+    print("Mesh Lock v1.2.0: disabled")
 
 if __name__ == "__main__":
     register()
