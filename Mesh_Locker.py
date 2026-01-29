@@ -13,7 +13,7 @@
 
 bl_info = {
     "name": "Mesh Lock",
-    "author": "Claude AI / ChatGPT",
+    "author": "Ayaka Matsubayashi",
     "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mesh Lock",
